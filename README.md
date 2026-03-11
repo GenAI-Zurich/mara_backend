@@ -46,14 +46,6 @@ Split-screen comparison showing baseline RAG vs MARA side by side.
 A live violation counter updates in real time. The judge sets their own
 constraints and watches MARA hold them across the entire conversation.
 
-## Hackathon
-
-**Event:** GenAI Zürich Hackathon 2026
-**Challenge:** Qdrant — GenAI in Retail
-**Prize:** $1,500 Qdrant cloud credits + 5,000 CHF main prize
-**Online build:** March 2–18, 2026
-**On-site:** April 1–2, 2026 (Volkshaus, Zürich)
-
 ## Quick Start
 
 ```bash
