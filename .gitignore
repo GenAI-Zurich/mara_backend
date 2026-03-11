@@ -1,0 +1,38 @@
+# Secrets
+.env
+.env.*
+!.env_example
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+env/
+
+# Local data and generated artifacts
+*.log
+*.tmp
+*.temp
+*.bak
+*.swp
+.DS_Store
+
+# Local MARA exports / experiments
+supabase_schema.json
+supabase_openapi.json
+catalog_export.json
+products_real*.json
+
+# Local planning / context notes
+ARCHITECTURE.md
+CONTEXT.md
+
+# Not part of the MARA root project
+/braight/
+/old_files/
