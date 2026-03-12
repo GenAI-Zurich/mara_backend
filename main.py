@@ -1,35 +1,4 @@
-"""
-MARA — main.py (Final Version)
-================================
-The central hub. Wires everything together.
-
-WHAT THIS FILE DOES:
-  1. Receives requests from Lu's Lovable frontend
-  2. Searches the product catalog via mara_engine.py
-  3. Reads + writes user memory via user_memory.py
-  4. Generates a natural language reply via Groq (Nursena's LLM)
-  5. Returns everything to the frontend in one response
-
-FILES THIS IMPORTS:
-  mara_engine.py   → product search (Simeon)
-  user_memory.py   → user learning (Simeon)
-  embeddings.py    → text → vectors (Nursena) ← swap mock when ready
-
-HOW TO RUN:
-  uvicorn main:app --reload --port 8001
-
-ENDPOINTS:
-  POST /constraints → judge sets hard rules
-  POST /browse      → user clicks a product
-  POST /chat        → main search + LLM reply
-
-FULL RESPONSE FROM /chat:
-  baseline_results  → left panel  (standard RAG, no constraints)
-  mara_results      → right panel (constraint-aware + memory)
-  llm_reply         → natural language response from Groq
-  user_context      → what MARA remembers about this user
-  violation_count   → live counter for Lu's frontend
-"""
+"""FastAPI application for MARA product retrieval and memory orchestration."""
 
 import os
 from datetime import datetime, timezone
@@ -38,14 +7,12 @@ from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 
-# ── Load environment variables ───────────────
 env_path = Path(__file__).parent / ".env"
 load_dotenv(dotenv_path=env_path)
 
-# ── MARA modules ─────────────────────────────
 from mara_engine import (
     run_baseline,
     run_mara,
@@ -62,18 +29,8 @@ from user_memory import (
 from embeddings import embed
 
 
-# ─────────────────────────────────────────────
-# GROQ LLM
-# ─────────────────────────────────────────────
-
 def call_groq(system_prompt: str, user_message: str) -> str:
-    """
-    Calls Groq API with Llama 3.3 70B.
-    Returns a natural language response string.
-
-    If GROQ_API_KEY is missing → returns a fallback message.
-    API still works even without Groq configured.
-    """
+    """Return a natural-language answer from Groq or a fallback message."""
     api_key = os.getenv("GROQ_API_KEY")
 
     if not api_key:
@@ -105,17 +62,33 @@ def build_llm_prompt(
     mara_products: list,
     baseline_products: list,
 ) -> str:
-    """
-    Builds the system prompt injected into Groq.
-    Combines user memory + MARA results so the reply feels personal.
-    """
+    """Build the prompt passed to the LLM."""
     mara_lines = []
     for i, p in enumerate(mara_products[:3], 1):
-        name  = p.get("name", "?")
-        price = p.get("price_chf", "?")
-        watt  = p.get("wattage", "?")
-        mat   = p.get("material", "?")
-        mara_lines.append(f"  {i}. {name} — {price} CHF, {watt}W, {mat}")
+        name = p.get("name", "?")
+        details = []
+
+        price = p.get("price_chf")
+        if price is not None:
+            details.append(f"{price} CHF")
+
+        watt = p.get("wattage")
+        if watt is not None:
+            details.append(f"{watt}W")
+
+        kelvin = p.get("kelvin")
+        if kelvin is not None:
+            details.append(f"{int(kelvin) if float(kelvin).is_integer() else kelvin}K")
+
+        finish = p.get("finish")
+        if finish:
+            details.append(str(finish))
+
+        manufacturer = p.get("manufacturer")
+        if manufacturer:
+            details.append(str(manufacturer))
+
+        mara_lines.append(f"  {i}. {name}" + (f" — {', '.join(details)}" if details else ""))
 
     baseline_top = baseline_products[0]["name"] if baseline_products else "unknown"
 
@@ -138,11 +111,6 @@ YOUR RULES:
 4. Never mention "MARA", "baseline", "vectors", or technical terms.
 5. If no products match, say so honestly and suggest relaxing a constraint."""
 
-
-# ─────────────────────────────────────────────
-# APP SETUP
-# ─────────────────────────────────────────────
-
 app = FastAPI(
     title       = "MARA API",
     description = "Memory-Augmented Retail Agent — Qdrant-powered lighting recommendations",
@@ -157,26 +125,16 @@ app.add_middleware(
     allow_headers     = ["*"],
 )
 
-
-# ─────────────────────────────────────────────
-# SESSION STORE (in-memory)
-# Constraints and browsing history for this session.
-# user_memory.py persists everything to Qdrant across sessions.
-# ─────────────────────────────────────────────
-
+# In-memory state for the current process. Persistent memory lives in Qdrant.
 constraints_store: dict[str, UserConstraints] = {}
 browsing_store:    dict[str, list[dict]]       = {}
 
-
-# ─────────────────────────────────────────────
-# REQUEST / RESPONSE MODELS
-# ─────────────────────────────────────────────
 
 class ConstraintsRequest(BaseModel):
     user_id:             str
     max_wattage:         Optional[float] = None
     max_price_chf:       Optional[float] = None
-    forbidden_materials: list[str]       = []
+    forbidden_materials: list[str]       = Field(default_factory=list)
     kelvin_min:          Optional[float] = None
     kelvin_max:          Optional[float] = None
     room_type:           Optional[str]   = None
@@ -196,19 +154,51 @@ class ChatRequest(BaseModel):
 
 class ProductResult(BaseModel):
     product_id:       str
+    source_article_id: Optional[int] = None
+    source_article_number: Optional[str] = None
+    source_l_number:  Optional[int] = None
     name:             str
-    price_chf:        float
-    wattage:          float
-    kelvin:           float
-    material:         str
-    style:            str
-    finish:           str
-    mood:             str
-    room_type:        str
-    image_url:        str
+    manufacturer:     Optional[str] = None
+    category:         Optional[str] = None
+    family:           Optional[str] = None
+    price_chf:        Optional[float] = None
+    wattage:          Optional[float] = None
+    kelvin:           Optional[float] = None
+    material:         Optional[str] = None
+    style:            Optional[str] = None
+    finish:           Optional[str] = None
+    mood:             Optional[str] = None
+    room_type:        Optional[str] = None
+    image_url:        Optional[str] = None
+    tags:             list[str] = Field(default_factory=list)
     similarity_score: float
     final_score:      float
-    violations:       list[str]
+    violations:       list[str] = Field(default_factory=list)
+
+
+class HydrationTarget(BaseModel):
+    rank:                  int
+    product_id:            str
+    source_article_id:     Optional[int] = None
+    source_article_number: Optional[str] = None
+    source_l_number:       Optional[int] = None
+
+
+class FrontendHydration(BaseModel):
+    provider:              str
+    preferred_key:         str
+    ordered_article_ids:   list[int] = Field(default_factory=list)
+    ranked_targets:        list[HydrationTarget] = Field(default_factory=list)
+
+
+class FrontendContractInfo(BaseModel):
+    version:               str
+    primary_result_field:  str
+    hydration_provider:    str
+    hydration_key:         str
+    baseline_available:    bool
+    merge_strategy:        str
+
 
 class ChatResponse(BaseModel):
     user_id:          str
@@ -219,11 +209,9 @@ class ChatResponse(BaseModel):
     violation_count:  int
     constraints_used: dict
     user_context:     dict
+    hydration:        FrontendHydration
+    frontend:         FrontendContractInfo
 
-
-# ─────────────────────────────────────────────
-# HELPERS
-# ─────────────────────────────────────────────
 
 def get_constraints(user_id: str) -> UserConstraints:
     return constraints_store.get(user_id, UserConstraints())
@@ -251,7 +239,13 @@ def get_preferences(user_id: str, overrides: dict) -> UserPreferences:
 def scored_to_model(p: ScoredProduct) -> ProductResult:
     return ProductResult(
         product_id       = p.product_id,
+        source_article_id = p.source_article_id,
+        source_article_number = p.source_article_number,
+        source_l_number = p.source_l_number,
         name             = p.name,
+        manufacturer     = p.manufacturer,
+        category         = p.category,
+        family           = p.family,
         price_chf        = p.price_chf,
         wattage          = p.wattage,
         kelvin           = p.kelvin,
@@ -261,15 +255,35 @@ def scored_to_model(p: ScoredProduct) -> ProductResult:
         mood             = p.mood,
         room_type        = p.room_type,
         image_url        = p.image_url,
+        tags             = p.tags,
         similarity_score = p.similarity_score,
         final_score      = p.final_score,
         violations       = p.violations,
     )
 
 
-# ─────────────────────────────────────────────
-# ENDPOINTS
-# ─────────────────────────────────────────────
+def build_hydration_payload(products: list[ProductResult]) -> FrontendHydration:
+    ranked_targets = [
+        HydrationTarget(
+            rank=index,
+            product_id=product.product_id,
+            source_article_id=product.source_article_id,
+            source_article_number=product.source_article_number,
+            source_l_number=product.source_l_number,
+        )
+        for index, product in enumerate(products, start=1)
+    ]
+    ordered_article_ids = [
+        product.source_article_id
+        for product in products
+        if product.source_article_id is not None
+    ]
+    return FrontendHydration(
+        provider="supabase",
+        preferred_key="source_article_id",
+        ordered_article_ids=ordered_article_ids,
+        ranked_targets=ranked_targets,
+    )
 
 @app.get("/")
 def root():
@@ -281,15 +295,9 @@ def root():
     }
 
 
-# ── ENDPOINT 1: /constraints ─────────────────
 @app.post("/constraints")
 def save_constraints(req: ConstraintsRequest):
-    """
-    Judge sets their hard rules.
-    Saved in two places:
-      1. constraints_store (in-memory) → mara_engine uses this session
-      2. user_memory (Qdrant)          → persists as structural memory (λ=0.01)
-    """
+    """Store explicit hard constraints for the user."""
     constraints = UserConstraints(
         max_wattage         = req.max_wattage,
         max_price_chf       = req.max_price_chf,
@@ -324,15 +332,9 @@ def save_constraints(req: ConstraintsRequest):
     }
 
 
-# ── ENDPOINT 2: /browse ──────────────────────
 @app.post("/browse")
 def log_browse(req: BrowseRequest):
-    """
-    User clicks a product.
-    Saved in two places:
-      1. browsing_store (in-memory) → preference timing this session
-      2. user_memory (Qdrant)       → episodic memory (λ=0.30, fades fast)
-    """
+    """Record a browse event for session state and long-term memory."""
     if req.user_id not in browsing_store:
         browsing_store[req.user_id] = []
 
@@ -353,26 +355,14 @@ def log_browse(req: BrowseRequest):
     }
 
 
-# ── ENDPOINT 3: /chat ────────────────────────
 @app.post("/chat", response_model=ChatResponse)
 async def chat(req: ChatRequest):
-    """
-    The main endpoint. Runs in 6 steps:
-
-      1. Embed user message
-      2. Search product catalog — baseline + MARA in parallel
-      3. Load user memory from Qdrant
-      4. Call Groq LLM → natural language reply
-      5. Save new preferences detected in this message
-      6. Return everything for split-screen demo
-    """
+    """Run retrieval, load memory, generate the reply, and return results."""
     if not req.message.strip():
         raise HTTPException(status_code=400, detail="Message cannot be empty")
 
-    # Step 1 — embed
     query_vector = embed(req.message)
 
-    # Step 2 — search products
     constraints = get_constraints(req.user_id)
     preferences = get_preferences(req.user_id, {
         "preferred_style":  req.preferred_style,
@@ -382,19 +372,22 @@ async def chat(req: ChatRequest):
     baseline = run_baseline(query_vector)
     mara     = run_mara(query_vector, constraints, preferences)
 
-    # Step 3 — load user memory
     user_context = get_user_context(req.user_id, req.message)
 
-    # Step 4 — LLM reply
     mara_dicts = [
-        {"name": p.name, "price_chf": p.price_chf,
-         "wattage": p.wattage, "material": p.material}
+        {
+            "name": p.name,
+            "price_chf": p.price_chf,
+            "wattage": p.wattage,
+            "kelvin": p.kelvin,
+            "finish": p.finish,
+            "manufacturer": p.manufacturer,
+        }
         for p in mara
     ]
     system_prompt = build_llm_prompt(user_context, mara_dicts, baseline)
     llm_reply     = call_groq(system_prompt, req.message)
 
-    # Step 5 — save new preferences
     if req.preferred_style:
         save_chat_preference(req.user_id, f"prefers {req.preferred_style} style lighting")
     if req.preferred_mood:
@@ -402,13 +395,13 @@ async def chat(req: ChatRequest):
     if req.preferred_finish:
         save_chat_preference(req.user_id, f"likes {req.preferred_finish} finish")
 
-    # Step 6 — return
+    mara_models = [scored_to_model(p) for p in mara]
     return ChatResponse(
         user_id          = req.user_id,
         query            = req.message,
         llm_reply        = llm_reply,
         baseline_results = baseline,
-        mara_results     = [scored_to_model(p) for p in mara],
+        mara_results     = mara_models,
         violation_count  = sum(len(p.violations) for p in mara),
         constraints_used = {
             "max_wattage":         constraints.max_wattage,
@@ -424,13 +417,16 @@ async def chat(req: ChatRequest):
             "episodic_count":   len(user_context["episodic"]),
             "summary":          user_context["summary"],
         },
+        hydration = build_hydration_payload(mara_models),
+        frontend = FrontendContractInfo(
+            version="2026-03-12",
+            primary_result_field="mara_results",
+            hydration_provider="supabase",
+            hydration_key="source_article_id",
+            baseline_available=True,
+            merge_strategy="hydrate_supabase_then_enrich_with_mara",
+        ),
     )
-
-
-# ─────────────────────────────────────────────
-# DEBUG ENDPOINTS — remove before final demo
-# ─────────────────────────────────────────────
-
 @app.get("/debug/constraints/{user_id}")
 def debug_constraints(user_id: str):
     c = constraints_store.get(user_id)
@@ -458,10 +454,7 @@ def debug_history(user_id: str):
 
 @app.get("/debug/memory/{user_id}")
 async def debug_memory(user_id: str):
-    """
-    Shows everything MARA remembers about a user.
-    Demo moment — judge watches their memory grow in real time.
-    """
+    """Return the current memory context for a user."""
     context = get_user_context(user_id, "show me everything")
     return {
         "user_id":    user_id,

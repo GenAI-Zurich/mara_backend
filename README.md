@@ -1,123 +1,71 @@
-# MARA — Memory-Augmented Retail Agent
+# MARA
 
-> "Amazon remembers what you clicked. MARA remembers who you are."
+MARA is a memory-augmented retail agent for lighting search. It combines vector retrieval, persistent user memory, and hard-constraint enforcement so recommendations stay relevant across sessions.
 
-## What is MARA?
+## Core Idea
 
-MARA is an AI lighting assistant that learns from its users across sessions.
-Most retail AI agents treat all memory equally — a hard budget constraint fades
-just like a random browsing click. MARA solves this with a three-layer memory
-architecture where different types of information decay at different rates.
+Standard retrieval ranks products by similarity only. MARA adds:
 
-A judge sets their constraints once. MARA never forgets them.
-A user browses a product. MARA remembers it briefly, then lets it fade.
-A user mentions they love scandinavian style. MARA holds that for weeks.
+- hard constraints that should never be violated
+- soft preferences that influence ranking
+- episodic browsing signals that decay quickly
 
-## The Core Innovation
+## Architecture
 
-Standard RAG scores products by similarity only:
-```
-Score = Similarity(product, query)
-```
-
-MARA reparameterizes the retrieval space:
-```
-Score = Similarity(product, query)
-      × StructuralWeight(constraints)
-      × DecayFunction(memory_type, time_elapsed)
-```
-
-This means hard constraints (budget, wattage, material) never get violated.
-Soft preferences (style, mood, finish) influence results but fade over time.
-Recent browsing has small influence and disappears within days.
-
-## The Demo
-
-Split-screen comparison showing baseline RAG vs MARA side by side.
-
-**Judge sets constraints:** max 40W, under 200 CHF, no plastic, warm white only
-
-**Baseline RAG recommends:**
-- Chrome Ceiling Spot — 60W, 240 CHF, plastic ❌ violates everything
-
-**MARA recommends:**
-- Brass Wall Sconce — 35W, 175 CHF, metal, warm 2700K ✓ all constraints respected
-
-A live violation counter updates in real time. The judge sets their own
-constraints and watches MARA hold them across the entire conversation.
+- `Supabase` is the source of truth for the catalog
+- `extract_supabase_catalog.py` normalizes that catalog into MARA's canonical schema
+- `Qdrant` stores retrieval-optimized product vectors and user memory
+- `FastAPI` orchestrates retrieval, memory lookup, and response generation
+- `Groq / Llama 3.3` generates the natural-language reply
 
 ## Quick Start
 
 ```bash
-# 1. Install dependencies
-pip install fastapi uvicorn qdrant-client sentence-transformers groq python-dotenv
-
-# 2. Start Qdrant locally
-docker run -p 6333:6333 qdrant/qdrant
-
-# 3. Create .env file
-cp .env.example .env
-# Fill in GROQ_API_KEY and HF_TOKEN
-
-# 4. Index the product catalog
-python3 setup_qdrant.py
-
-# 5. Start the API
-uvicorn main:app --reload --port 8001
-
-# 6. Open API docs
-open http://localhost:8001/docs
+python3.11 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+cp .env_example .env
+python extract_supabase_catalog.py --output catalog_export.json
+python setup_qdrant.py
+python -m uvicorn main:app --reload --port 8001
 ```
 
-## Environment Variables
+## Required Environment Variables
 
 ```bash
-# .env
-QDRANT_URL=http://localhost:6333      # local Docker
-QDRANT_API_KEY=                       # leave empty for local
-GROQ_API_KEY=gsk_xxxxx               # from console.groq.com (free)
-HF_TOKEN=hf_xxxxx                    # from huggingface.co (free)
+QDRANT_URL=https://your-qdrant-cluster-url:6333
+QDRANT_API_KEY=your_qdrant_api_key
+GROQ_API_KEY=gsk_your_groq_api_key
+HF_TOKEN=hf_your_huggingface_token
+SUPABASE_URL=https://your-project-ref.supabase.co
+SUPABASE_ANON_KEY=your_supabase_anon_key
 ```
 
-## File Structure
+## API
 
-```
-mara/
-├── products.json       # 30 synthetic lighting products (Step 1)
-├── setup_qdrant.py     # indexes catalog into Qdrant (Step 2)
-├── mara_engine.py      # decay engine + constraint scoring (Step 3)
-├── user_memory.py      # user learning across sessions (Step 4)
-├── embeddings.py       # HuggingFace BGE model (Nursena)
-├── main.py             # FastAPI endpoints, wires everything
-├── README.md           # this file
-├── ARCHITECTURE.md     # technical deep dive
-└── CONTEXT.md          # current status + team roles
-```
+- `POST /constraints` stores explicit hard constraints
+- `POST /browse` stores browse events as episodic memory
+- `POST /chat` returns the LLM reply, ranked results, and hydration metadata
+- `GET /debug/constraints/{user_id}` inspects active constraints
+- `GET /debug/history/{user_id}` inspects browse history
+- `GET /debug/memory/{user_id}` inspects stored memory
 
-## API Endpoints
+## Key Files
 
-| Method | Endpoint | Description |
-|--------|----------|-------------|
-| POST | `/constraints` | Judge sets hard rules |
-| POST | `/browse` | User clicks a product |
-| POST | `/chat` | Main search + LLM reply |
-| GET | `/debug/memory/{user_id}` | See what MARA remembers |
+- `main.py` FastAPI application
+- `mara_engine.py` retrieval, filtering, and reranking
+- `user_memory.py` user memory persistence and retrieval
+- `embeddings.py` embedding helpers
+- `extract_supabase_catalog.py` catalog extraction and normalization
+- `setup_qdrant.py` Qdrant indexing
+- `CATALOG_SCHEMA.md` canonical catalog schema
+- `FRONTEND_CONTRACT.md` frontend integration contract
 
-## Tech Stack
+## Frontend Contract
 
-| Layer | Technology | Owner |
-|-------|-----------|-------|
-| Frontend | Lovable (React) | Lu |
-| API | FastAPI (Python) | Nursena |
-| Vector DB | Qdrant Cloud | Simeon |
-| Embeddings | HuggingFace BGE-large | Nursena |
-| LLM | Groq / Llama 3.3 70B | Nursena |
-| Memory Engine | Custom decay engine | Simeon |
+The backend returns MARA-ranked results plus hydration metadata. Frontends should:
 
-## Team
-
-- **Simeon** — Agent Core, Memory Architecture, Qdrant
-- **Nursena** — FastAPI, Embeddings, LLM (Groq)
-- **Lu** — Frontend (Lovable), Product Catalog
-- **Domenica** — Business Model, Investor Story
-- **Ben** — Demo Video, Pitch, Submission
+1. call `POST /chat`
+2. preserve MARA rank order
+3. hydrate product details from Supabase using `source_article_id`
+4. merge Supabase product data with MARA scores and metadata

@@ -1,31 +1,13 @@
-"""
-MARA — user_memory.py
-======================
-Stores and retrieves everything the user has ever told MARA.
-
-This is what makes MARA a LEARNING system — not just a search engine.
-Every message, every constraint, every click is remembered here
-with the correct decay rate so the right things persist.
-
-THREE MEMORY TYPES:
-  structural  (λ = 0.01) — hard constraints, almost never fade
-  semantic    (λ = 0.10) — style preferences, slow drift
-  episodic    (λ = 0.30) — recent browsing/clicks, fades fast
-
-COLLECTION: "user_memory" (single collection, type stored in payload)
-
-WHO USES THIS FILE:
-  Simeon  → owns this file, adds memory after each interaction
-  main.py → calls save_memory() and get_user_context()
-  No one else needs to touch this file.
-"""
+"""Persistence and retrieval for user memory stored in Qdrant."""
 
 import os
 import time
 import math
 import uuid
+from pathlib import Path
 from dataclasses import dataclass
 
+from dotenv import load_dotenv
 from qdrant_client import QdrantClient
 from qdrant_client.models import (
     VectorParams,
@@ -34,55 +16,37 @@ from qdrant_client.models import (
     Filter,
     FieldCondition,
     MatchValue,
+    PayloadSchemaType,
 )
 
-# ─────────────────────────────────────────────
-# CONFIG
-# ─────────────────────────────────────────────
+env_path = Path(__file__).resolve().parent / ".env"
+load_dotenv(dotenv_path=env_path)
+
 QDRANT_URL      = os.getenv("QDRANT_URL", "http://localhost:6333")
 QDRANT_API_KEY  = os.getenv("QDRANT_API_KEY", None)
 COLLECTION_NAME = "user_memory"
-VECTOR_SIZE     = 1024  # must match embedding model
+VECTOR_SIZE     = 1024
 
-# Lambda decay rates — same as mara_engine.py
 LAMBDA = {
-    "structural": 0.01,  # hard constraints — almost never fade
-    "semantic":   0.10,  # style/finish preferences — slow drift
-    "episodic":   0.30,  # recent clicks/browsing — fades fast
+    "structural": 0.01,
+    "semantic":   0.10,
+    "episodic":   0.30,
 }
 
-# How many memories to retrieve per type when building context
-TOP_STRUCTURAL = 5   # always retrieve all hard constraints
-TOP_SEMANTIC   = 5   # top style preferences
-TOP_EPISODIC   = 3   # only very recent browsing matters
-
-
-# ─────────────────────────────────────────────
-# DATA STRUCTURE
-# ─────────────────────────────────────────────
+TOP_STRUCTURAL = 5
+TOP_SEMANTIC   = 5
+TOP_EPISODIC   = 3
 
 @dataclass
 class MemoryEntry:
-    """
-    A single memory stored for a user.
-
-    Examples:
-        MemoryEntry("user_01", "structural", "max budget 200 CHF")
-        MemoryEntry("user_01", "semantic",   "loves scandinavian style")
-        MemoryEntry("user_01", "episodic",   "just clicked brass wall sconce")
-    """
     user_id:     str
-    memory_type: str   # "structural" | "semantic" | "episodic"
-    text:        str   # the raw text that gets embedded
-    source:      str = "chat"   # "chat" | "browse" | "constraint"
+    memory_type: str
+    text:        str
+    source:      str = "chat"
 
 
 from embeddings import embed
 
-
-# ─────────────────────────────────────────────
-# CLIENT
-# ─────────────────────────────────────────────
 
 def _get_client() -> QdrantClient:
     if QDRANT_API_KEY:
@@ -90,17 +54,8 @@ def _get_client() -> QdrantClient:
     return QdrantClient(url=QDRANT_URL)
 
 
-# ─────────────────────────────────────────────
-# SETUP — run once
-# ─────────────────────────────────────────────
-
 def setup_collection():
-    """
-    Creates the user_memory collection in Qdrant.
-    Run this once — safe to re-run, it checks first.
-
-    Called automatically by save_memory() if collection doesn't exist.
-    """
+    """Ensure the memory collection and filter indexes exist."""
     client = _get_client()
     if not client.collection_exists(COLLECTION_NAME):
         client.create_collection(
@@ -112,48 +67,27 @@ def setup_collection():
         )
         print(f"Created collection: {COLLECTION_NAME}")
 
+    client.create_payload_index(
+        collection_name=COLLECTION_NAME,
+        field_name="user_id",
+        field_schema=PayloadSchemaType.KEYWORD,
+    )
+    client.create_payload_index(
+        collection_name=COLLECTION_NAME,
+        field_name="memory_type",
+        field_schema=PayloadSchemaType.KEYWORD,
+    )
 
-# ─────────────────────────────────────────────
-# DECAY
-# ─────────────────────────────────────────────
 
 def _decay(memory_type: str, timestamp: float) -> float:
-    """
-    Calculates how much a memory has faded since it was created.
-
-    score × e^(-λ × days_elapsed)
-
-    Returns a multiplier between 0.0 and 1.0.
-    1.0 = fresh memory, full weight
-    0.0 = completely faded, no influence
-    """
-    days_elapsed = (time.time() - timestamp) / 86400  # seconds → days
+    """Return the decay multiplier for a stored memory."""
+    days_elapsed = (time.time() - timestamp) / 86400
     lam = LAMBDA.get(memory_type, 0.10)
     return math.exp(-lam * days_elapsed)
 
 
-# ─────────────────────────────────────────────
-# SAVE MEMORY
-# ─────────────────────────────────────────────
-
 def save_memory(entry: MemoryEntry) -> str:
-    """
-    Saves a single memory to Qdrant.
-    Returns the memory ID.
-
-    Called from main.py after every:
-      - /constraints call  → memory_type = "structural"
-      - /browse call       → memory_type = "episodic"
-      - /chat call         → memory_type = "semantic" (if preference detected)
-
-    Example:
-        save_memory(MemoryEntry(
-            user_id     = "judge_01",
-            memory_type = "structural",
-            text        = "maximum wattage 40W",
-            source      = "constraint",
-        ))
-    """
+    """Persist a single memory entry and return its generated id."""
     setup_collection()
     client  = _get_client()
     vector  = embed(entry.text)
@@ -164,7 +98,7 @@ def save_memory(entry: MemoryEntry) -> str:
         collection_name=COLLECTION_NAME,
         points=[
             PointStruct(
-                id      = abs(hash(mem_id)) % (2**63),  # Qdrant needs int ID
+                id      = abs(hash(mem_id)) % (2**63),
                 vector  = vector,
                 payload = {
                     "mem_id":      mem_id,
@@ -182,43 +116,16 @@ def save_memory(entry: MemoryEntry) -> str:
 
 
 def save_many(entries: list[MemoryEntry]) -> list[str]:
-    """Save multiple memories at once. More efficient than calling save_memory in a loop."""
+    """Persist multiple memory entries."""
     return [save_memory(e) for e in entries]
 
 
-# ─────────────────────────────────────────────
-# RETRIEVE USER CONTEXT
-# ─────────────────────────────────────────────
-
 def get_user_context(user_id: str, query: str) -> dict:
-    """
-    The main function called from /chat.
-
-    Returns a structured context dict with:
-      - structural: hard constraints (never violated)
-      - semantic:   style preferences (decay-weighted)
-      - episodic:   recent browsing (decay-weighted, fades fast)
-      - summary:    plain text for the LLM system prompt
-
-    Example output:
-        {
-            "structural": [
-                {"text": "max budget 200 CHF", "decay_weight": 0.99},
-                {"text": "no plastic",          "decay_weight": 0.99},
-            ],
-            "semantic": [
-                {"text": "loves scandinavian style", "decay_weight": 0.87},
-            ],
-            "episodic": [
-                {"text": "clicked brass wall sconce", "decay_weight": 0.43},
-            ],
-            "summary": "..."   ← injected into LLM system prompt
-        }
-    """
+    """Return the current structured memory context for a user."""
+    setup_collection()
     client       = _get_client()
     query_vector = embed(query)
 
-    # ── Fetch each memory type separately ────────
     def fetch(memory_type: str, limit: int) -> list[dict]:
         type_filter = Filter(
             must=[
@@ -251,14 +158,12 @@ def get_user_context(user_id: str, query: str) -> dict:
                 "timestamp":    p.get("timestamp", 0),
             })
 
-        # Re-rank by final score (similarity × decay)
         return sorted(memories, key=lambda x: x["final_score"], reverse=True)
 
     structural = fetch("structural", TOP_STRUCTURAL)
     semantic   = fetch("semantic",   TOP_SEMANTIC)
     episodic   = fetch("episodic",   TOP_EPISODIC)
 
-    # ── Build plain text summary for LLM ─────────
     lines = []
 
     if structural:
@@ -286,43 +191,30 @@ def get_user_context(user_id: str, query: str) -> dict:
     }
 
 
-# ─────────────────────────────────────────────
-# HELPERS FOR main.py
-# ─────────────────────────────────────────────
-
 def save_constraints_as_memory(user_id: str, constraints: dict):
-    """
-    Called from POST /constraints in main.py.
-    Converts constraint fields into structural memories.
-
-    Example:
-        save_constraints_as_memory("judge_01", {
-            "max_wattage": 40,
-            "max_price_chf": 200,
-            "forbidden_materials": ["plastic"],
-        })
-        → saves 3 structural memories
-    """
+    """Persist explicit hard constraints as structural memory."""
     entries = []
 
     if constraints.get("max_wattage"):
         entries.append(MemoryEntry(
-            user_id="judge_01", memory_type="structural",
+            user_id=user_id,
+            memory_type="structural",
             text=f"maximum wattage {constraints['max_wattage']}W",
             source="constraint",
         ))
-        entries[-1].user_id = user_id
 
     if constraints.get("max_price_chf"):
         entries.append(MemoryEntry(
-            user_id=user_id, memory_type="structural",
+            user_id=user_id,
+            memory_type="structural",
             text=f"maximum budget {constraints['max_price_chf']} CHF",
             source="constraint",
         ))
 
     for mat in constraints.get("forbidden_materials", []):
         entries.append(MemoryEntry(
-            user_id=user_id, memory_type="structural",
+            user_id=user_id,
+            memory_type="structural",
             text=f"forbidden material: {mat}",
             source="constraint",
         ))
@@ -331,14 +223,16 @@ def save_constraints_as_memory(user_id: str, constraints: dict):
         kmin = constraints.get("kelvin_min", "any")
         kmax = constraints.get("kelvin_max", "any")
         entries.append(MemoryEntry(
-            user_id=user_id, memory_type="structural",
+            user_id=user_id,
+            memory_type="structural",
             text=f"color temperature range {kmin}K to {kmax}K",
             source="constraint",
         ))
 
     if constraints.get("room_type"):
         entries.append(MemoryEntry(
-            user_id=user_id, memory_type="structural",
+            user_id=user_id,
+            memory_type="structural",
             text=f"room type: {constraints['room_type']}",
             source="constraint",
         ))
@@ -349,10 +243,7 @@ def save_constraints_as_memory(user_id: str, constraints: dict):
 
 
 def save_browse_as_memory(user_id: str, product_name: str, product_description: str):
-    """
-    Called from POST /browse in main.py.
-    Saves a product click as an episodic memory.
-    """
+    """Persist a browse event as episodic memory."""
     entry = MemoryEntry(
         user_id     = user_id,
         memory_type = "episodic",
@@ -363,10 +254,7 @@ def save_browse_as_memory(user_id: str, product_name: str, product_description: 
 
 
 def save_chat_preference(user_id: str, preference_text: str):
-    """
-    Called from POST /chat in main.py when a style preference is detected.
-    Example: user says "I love warm cozy lights" → semantic memory.
-    """
+    """Persist a chat-derived preference as semantic memory."""
     entry = MemoryEntry(
         user_id     = user_id,
         memory_type = "semantic",
@@ -374,59 +262,3 @@ def save_chat_preference(user_id: str, preference_text: str):
         source      = "chat",
     )
     return save_memory(entry)
-
-
-# ─────────────────────────────────────────────
-# QUICK TEST
-# ─────────────────────────────────────────────
-
-if __name__ == "__main__":
-    print("=" * 55)
-    print("  MARA — User Memory Test")
-    print("=" * 55)
-
-    USER = "test_judge"
-
-    # 1. Save structural constraints
-    print("\n[1] Saving structural constraints...")
-    save_constraints_as_memory(USER, {
-        "max_wattage":         40,
-        "max_price_chf":       200,
-        "forbidden_materials": ["plastic"],
-        "kelvin_min":          2700,
-        "kelvin_max":          3200,
-    })
-
-    # 2. Save semantic preferences
-    print("\n[2] Saving semantic preferences...")
-    save_chat_preference(USER, "loves scandinavian minimalist style")
-    save_chat_preference(USER, "prefers warm light tones, cozy atmosphere")
-    save_chat_preference(USER, "likes brushed brass and natural materials")
-
-    # 3. Save episodic browsing
-    print("\n[3] Saving episodic browsing...")
-    save_browse_as_memory(USER, "Auro Brass Wall Sconce",
-        "brushed brass wall sconce warm 2700K scandinavian")
-    save_browse_as_memory(USER, "Linen Dome Floor Lamp",
-        "fabric floor lamp warm cozy bedroom light")
-
-    # 4. Retrieve context
-    print("\n[4] Retrieving user context for query...")
-    query   = "I need a light for my reading corner"
-    context = get_user_context(USER, query)
-
-    print(f"\nQuery: '{query}'\n")
-    print("─── Structural (hard constraints) ──────────────")
-    for m in context["structural"]:
-        print(f"  [{m['decay_weight']:.2f}] {m['text']}")
-
-    print("\n─── Semantic (preferences) ──────────────────────")
-    for m in context["semantic"]:
-        print(f"  [{m['decay_weight']:.2f}] {m['text']}")
-
-    print("\n─── Episodic (recent browsing) ──────────────────")
-    for m in context["episodic"]:
-        print(f"  [{m['decay_weight']:.2f}] {m['text']}")
-
-    print("\n─── LLM Summary ─────────────────────────────────")
-    print(context["summary"])
